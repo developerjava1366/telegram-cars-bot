@@ -20,7 +20,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    Dispatcher,
 )
 
 # --- CONFIG ---
@@ -91,9 +90,7 @@ def main_menu_keyboard():
 
 def models_keyboard(car_name: str):
     models = CARS.get(car_name, [])
-    kb = []
-    for m in models:
-        kb.append([InlineKeyboardButton(text=m, callback_data=f"model|{car_name}|{m}")])
+    kb = [[InlineKeyboardButton(text=m, callback_data=f"model|{car_name}|{m}")] for m in models]
     kb.append([InlineKeyboardButton(text="🔙 برگشت", callback_data="back_main")])
     kb.append([InlineKeyboardButton(text="🧾 سبد خرید", callback_data="view_cart")])
     return InlineKeyboardMarkup(kb)
@@ -146,19 +143,141 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"سلام {user.first_name}!\nبه ربات فروش قطعات خودرو خوش اومدی.\nیکی از برندها رو انتخاب کن:" 
     await update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
-# === اینجا تمام هندلرهای قبلی callback_router, show_cart, handle_checkout, cart_command, help_command را همانند نسخه قبلی اضافه کنید ===
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+
+    if data == "view_cart":
+        await show_cart(query, context)
+        return
+    if data == "back_main":
+        await query.message.edit_text("منو اصلی:", reply_markup=main_menu_keyboard())
+        return
+    if data.startswith("car|"):
+        _, car_name = data.split("|", 1)
+        await query.message.edit_text(f"مدل‌های " + car_name + ":", reply_markup=models_keyboard(car_name))
+        return
+    if data.startswith("model|"):
+        _, car_name, model = data.split("|", 2)
+        await query.message.edit_text(f"انتخاب برای {car_name} — {model}:", reply_markup=model_options_keyboard(car_name, model))
+        return
+    if data.startswith("tires_type|"):
+        _, car_name, model, tire_type = data.split("|", 3)
+        await query.message.edit_text(f"لاستیک {tire_type} — انتخاب سایز:", reply_markup=tires_size_keyboard(car_name, model, tire_type))
+        return
+    if data.startswith("part|"):
+        _, car_name, model, part_key = data.split("|", 3)
+        if part_key == "لایت‌بک":
+            price = OTHER_PARTS_PRICES.get("لایت‌بک خارجی", 205)
+            await query.message.edit_text(f"{part_key} — قیمت: {price} تومان", reply_markup=part_confirm_keyboard(car_name, model, "لایت‌بک خارجی", price))
+            return
+        price = OTHER_PARTS_PRICES.get(part_key, 100)
+        await query.message.edit_text(f"{part_key} — قیمت: {price} تومان", reply_markup=part_confirm_keyboard(car_name, model, part_key, price))
+        return
+    if data.startswith("add_item|"):
+        parts = data.split("|")
+        if len(parts) < 6:
+            await query.message.reply_text("دادهٔ محصول نامعتبر است.")
+            return
+        _, car_name, model, item_name, meta, price_str = parts
+        price = int(price_str)
+        item = {"car": car_name, "model": model, "name": item_name, "meta": meta, "price": price, "qty": 1}
+        cart = get_cart(user_id)
+        cart_items = cart.get("items", [])
+        cart_items.append(item)
+        cart["items"] = cart_items
+        update_cart(user_id, cart)
+        await query.message.reply_text(f"✅ '{item_name} ({meta})' به سبد اضافه شد — {price} تومان")
+        return
+    if data == "clear_cart":
+        clear_cart(user_id)
+        await query.message.reply_text("🗑️ سبد خرید پاک شد.")
+        return
+    if data == "checkout":
+        await handle_checkout(query, context)
+        return
+    if data.startswith("back_models|"):
+        _, car_name = data.split("|", 1)
+        await query.message.edit_text(f"مدل‌های " + car_name + ":", reply_markup=models_keyboard(car_name))
+        return
+    if data.startswith("back_model_options|"):
+        _, car_name, model = data.split("|", 2)
+        await query.message.edit_text(f"انتخاب برای {car_name} — {model}:", reply_markup=model_options_keyboard(car_name, model))
+        return
+
+    await query.message.reply_text("عملیات نامعتبر یا منقضی شده. از منو استفاده کن.")
+
+async def show_cart(query, context: ContextTypes.DEFAULT_TYPE):
+    user_id = query.from_user.id
+    cart = get_cart(user_id)
+    items = cart.get("items", [])
+    if not items:
+        await query.message.edit_text("سبد خرید شما خالی است.", reply_markup=cart_keyboard(user_id))
+        return
+    lines = []
+    total = 0
+    for i, it in enumerate(items, 1):
+        subtotal = it["price"] * it["qty"]
+        total += subtotal
+        lines.append(f"{i}. {it['car']} - {it['model']} - {it['name']} ({it['meta']}) ×{it['qty']} = {subtotal} تومان")
+    lines.append(f"\nجمع کل: {total} تومان")
+    await query.message.edit_text("\n".join(lines), reply_markup=cart_keyboard(user_id))
+
+async def handle_checkout(query, context: ContextTypes.DEFAULT_TYPE):
+    user = query.from_user
+    user_id = user.id
+    cart = get_cart(user_id)
+    items = cart.get("items", [])
+    if not items:
+        await query.message.reply_text("سبد خرید خالی است.")
+        return
+    lines = [f"سفارش جدید از @{user.username if user.username else user.first_name} (id: {user_id})"]
+    total = 0
+    for i, it in enumerate(items, 1):
+        subtotal = it["price"] * it["qty"]
+        total += subtotal
+        lines.append(f"{i}. {it['car']} - {it['model']} - {it['name']} ({it['meta']}) ×{it['qty']} = {subtotal} تومان")
+    lines.append(f"\nجمع کل: {total} تومان")
+    text = "\n".join(lines)
+    try:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID_INT, text=text)
+    except Exception as e:
+        logger.exception("Failed to send order to admin")
+        await query.message.reply_text("خطا در ارسال سفارش. لطفا بعداً دوباره تلاش کن.")
+        return
+    clear_cart(user_id)
+    await query.message.reply_text("✅ سفارش شما با موفقیت ارسال شد. ما به زودی با شما تماس می‌گیریم.")
+
+async def cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    cart = get_cart(user.id)
+    items = cart.get("items", [])
+    if not items:
+        await update.message.reply_text("سبد خرید شما خالی است.")
+        return
+    lines = []
+    total = 0
+    for i, it in enumerate(items, 1):
+        subtotal = it["price"] * it["qty"]
+        total += subtotal
+        lines.append(f"{i}. {it['car']} - {it['model']} - {it['name']} ({it['meta']}) ×{it['qty']} = {subtotal} تومان")
+    lines.append(f"\nجمع کل: {total} تومان")
+    await update.message.reply_text("\n".join(lines))
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("از دکمه‌ها برای انتخاب ماشین، مدل و قطعه استفاده کن. /cart برای دیدن سبد، /start برای منو")
 
 # --- Flask routes for Webhook ---
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    """Receive updates from Telegram and process them"""
     update = Update.de_json(request.get_json(force=True), bot_app.bot)
     bot_app.dispatcher.process_update(update)
     return "OK"
 
 @app.route("/")
 def index():
-    """Simple page for pings"""
     return "Telegram bot is running!"
 
 # --- App start ---
@@ -169,7 +288,6 @@ bot_app.add_handler(CommandHandler("help", help_command))
 bot_app.add_handler(CallbackQueryHandler(callback_router))
 
 if __name__ == "__main__":
-    # Set webhook
     webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
     logger.info(f"Setting webhook to: {webhook_url}")
     bot_app.run_webhook(
